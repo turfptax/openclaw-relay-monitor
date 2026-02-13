@@ -24,14 +24,20 @@ Protocol — four packet types:
 
 Relay events:  "sent" | "received" | "system"
 All packets carry  magic: "CLAUDE-UDP-V1".
+
+Persistence:
+  relay_log.jsonl     — append-only log of every message (one JSON per line)
+  relay_settings.json — agent custom names and colors, survives restarts
 """
 
+import os
 import socket
 import threading
 import json
 import time
+import sys
 from datetime import datetime
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, send_file
 from flask_socketio import SocketIO
 
 # =============================================================================
@@ -43,46 +49,147 @@ WEB_PORT     = 5000
 MAX_MESSAGES = 500
 BIND_ADDRESS = '0.0.0.0'
 
+BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE      = os.path.join(BASE_DIR, 'relay_log.jsonl')
+SETTINGS_FILE = os.path.join(BASE_DIR, 'relay_settings.json')
+
+STALE_AGENT_HOURS = 24      # Prune agents not seen in this many hours
+
 # =============================================================================
-# State
+# State  (all guarded by _lock)
 # =============================================================================
-MESSAGES = []
-AGENTS   = {}               # keyed by agent_id string
+_lock = threading.RLock()
+
+MESSAGES      = []
+AGENTS        = {}           # keyed by agent_id string
+AGENT_COUNTER = 0
+START_TIME    = time.time()
+STATS         = {'relay': 0, 'discovery': 0, 'message': 0, 'unknown': 0}
+
 AGENT_COLORS = [
     '#00d4ff', '#ff6b6b', '#51cf66', '#ffd43b', '#cc5de8',
     '#ff922b', '#20c997', '#e599f7', '#74c0fc', '#f06595',
 ]
-AGENT_COUNTER = 0
-START_TIME    = time.time()
-STATS = {'relay': 0, 'discovery': 0, 'message': 0, 'unknown': 0}
+
+_running   = True            # Listener shutdown flag
+_send_sock = None            # Reusable send socket
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'openclaw-relay-monitor'
 socketio = SocketIO(app, async_mode='threading', cors_allowed_origins='*')
 
 # =============================================================================
-# Helpers
+# Helpers — network interface discovery
 # =============================================================================
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))
-        return s.getsockname()[0]
-    except Exception:
-        return '127.0.0.1'
-    finally:
-        s.close()
+def get_all_interfaces():
+    """Return a list of IPv4 interfaces: [{name, ip, broadcast, netmask}].
+    Uses socket/OS methods for cross-platform support (Windows, Linux, macOS).
+    """
+    interfaces = []
+    seen_ips = set()
 
-def get_broadcast_address():
+    # ── Method 1: netifaces (most reliable if installed) ─────────
     try:
-        p = get_local_ip().split('.')
-        p[3] = '255'
-        return '.'.join(p)
-    except Exception:
-        return '255.255.255.255'
+        import netifaces
+        for iface_name in netifaces.interfaces():
+            addrs = netifaces.ifaddresses(iface_name)
+            for info in addrs.get(netifaces.AF_INET, []):
+                ip = info.get('addr', '')
+                if ip and ip != '127.0.0.1' and ip not in seen_ips:
+                    seen_ips.add(ip)
+                    broadcast = info.get('broadcast', '')
+                    if not broadcast:
+                        parts = ip.split('.')
+                        parts[3] = '255'
+                        broadcast = '.'.join(parts)
+                    interfaces.append({
+                        'name': iface_name,
+                        'ip': ip,
+                        'broadcast': broadcast,
+                        'netmask': info.get('netmask', '255.255.255.0'),
+                    })
+        if interfaces:
+            return interfaces
+    except ImportError:
+        pass
 
-LOCAL_IP     = get_local_ip()
-BROADCAST_IP = get_broadcast_address()
+    # ── Method 2: psutil (common on many systems) ────────────────
+    try:
+        import psutil
+        for iface_name, addrs in psutil.net_if_addrs().items():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and addr.address != '127.0.0.1':
+                    ip = addr.address
+                    if ip in seen_ips or ip.startswith('169.254.'):
+                        continue   # skip link-local / APIPA
+                    seen_ips.add(ip)
+                    broadcast = addr.broadcast or ''
+                    if not broadcast:
+                        parts = ip.split('.')
+                        parts[3] = '255'
+                        broadcast = '.'.join(parts)
+                    interfaces.append({
+                        'name': iface_name,
+                        'ip': ip,
+                        'broadcast': broadcast,
+                        'netmask': addr.netmask or '255.255.255.0',
+                    })
+        if interfaces:
+            return interfaces
+    except ImportError:
+        pass
+
+    # ── Method 3: socket.getaddrinfo fallback ────────────────────
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and ip != '127.0.0.1' and ip not in seen_ips:
+                seen_ips.add(ip)
+                parts = ip.split('.')
+                parts[3] = '255'
+                interfaces.append({
+                    'name': f'if-{len(interfaces)}',
+                    'ip': ip,
+                    'broadcast': '.'.join(parts),
+                    'netmask': '255.255.255.0',
+                })
+    except Exception:
+        pass
+
+    # ── Method 4: UDP connect trick (always gets at least one) ───
+    if not interfaces:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('10.255.255.255', 1))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and ip != '127.0.0.1':
+                parts = ip.split('.')
+                parts[3] = '255'
+                interfaces.append({
+                    'name': 'default',
+                    'ip': ip,
+                    'broadcast': '.'.join(parts),
+                    'netmask': '255.255.255.0',
+                })
+        except Exception:
+            pass
+
+    # ── Last resort ──────────────────────────────────────────────
+    if not interfaces:
+        interfaces.append({
+            'name': 'loopback',
+            'ip': '127.0.0.1',
+            'broadcast': '255.255.255.255',
+            'netmask': '255.0.0.0',
+        })
+
+    return interfaces
+
+INTERFACES   = get_all_interfaces()
+LOCAL_IP     = INTERFACES[0]['ip']          # primary IP (for display)
+BROADCAST_IP = INTERFACES[0]['broadcast']   # primary broadcast
 
 def parse_agent_id(agent_id):
     """
@@ -95,10 +202,64 @@ def parse_agent_id(agent_id):
         return ('', '')
     idx = agent_id.rfind('-')
     if idx > 0 and len(agent_id) - idx - 1 == 8:
-        suffix = agent_id[idx+1:]
+        suffix = agent_id[idx + 1:]
         if all(c in '0123456789abcdefABCDEF' for c in suffix):
             return (agent_id[:idx], suffix)
     return (agent_id, '')
+
+# =============================================================================
+# Persistence — JSONL log  +  settings
+# =============================================================================
+_saved_settings = {}   # loaded at startup, keyed by agent_id
+
+def _load_settings():
+    """Load relay_settings.json if it exists.  Returns dict."""
+    global _saved_settings
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            _saved_settings = data.get('agents', {})
+            print(f"  Settings loaded: {len(_saved_settings)} agent(s)")
+    except Exception as e:
+        print(f"  Warning: could not load settings: {e}", file=sys.stderr)
+        _saved_settings = {}
+
+def _save_settings():
+    """Persist agent custom names and colors to relay_settings.json."""
+    with _lock:
+        agents_data = {}
+        for aid, a in AGENTS.items():
+            if a.get('custom_name') or a.get('color'):
+                agents_data[aid] = {
+                    'custom_name': a.get('custom_name'),
+                    'color':       a.get('color', ''),
+                    'hostname':    a.get('hostname', ''),
+                }
+    try:
+        tmp = SETTINGS_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({
+                'agents':   agents_data,
+                'saved_at': datetime.now().isoformat(),
+            }, f, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception as e:
+        print(f"  Warning: could not save settings: {e}", file=sys.stderr)
+
+def _log_message(msg_entry):
+    """Append one message to the JSONL log.  Never raises."""
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(msg_entry, default=str) + '\n')
+    except Exception:
+        pass   # logging failure must not kill the listener
+
+def _settings_flush_loop():
+    """Background thread: save settings every 60 seconds."""
+    while _running:
+        time.sleep(60)
+        _save_settings()
 
 # =============================================================================
 # Protocol decoder
@@ -141,16 +302,19 @@ def decode_packet(raw):
         if relay_event == 'sent':
             info['from_id'] = agent_id
             info['to_id']   = peer_id or peer_addr
+            info['speaker'] = agent_id       # the agent spoke
             display  = payload or f'[SENT to {peer_id or peer_addr}]'
             category = 'relay-sent'
         elif relay_event == 'received':
             info['from_id'] = peer_id or peer_addr
             info['to_id']   = agent_id
+            info['speaker'] = peer_id or peer_addr  # the *peer* spoke
             display  = payload or f'[RECEIVED from {peer_id or peer_addr}]'
             category = 'relay-received'
         else:
             info['from_id'] = agent_id
             info['to_id']   = ''
+            info['speaker'] = agent_id
             display  = payload or f'[SYSTEM] {relay_event}'
             category = 'relay-system'
         return info, display, category
@@ -163,6 +327,7 @@ def decode_packet(raw):
         info = {
             'protocol': 'CLAUDE-UDP-V1', 'msg_type': msg_type,
             'sender_id': sender_id, 'sender_port': sender_port,
+            'speaker': sender_id,
         }
         _add_ts(info, ts)
         label = 'PING' if msg_type == 'discovery-ping' else 'PONG'
@@ -178,6 +343,7 @@ def decode_packet(raw):
         info = {
             'protocol': 'CLAUDE-UDP-V1', 'msg_type': 'message',
             'sender_id': sender_id, 'sender_port': sender_port,
+            'speaker': sender_id,
         }
         _add_ts(info, ts)
         if payload:
@@ -197,34 +363,40 @@ def _add_ts(info, ts):
 # =============================================================================
 # Agent registry
 # =============================================================================
-def register_agent(agent_id, ip=None):
-    """Register or update an agent.  Returns the agent dict or None."""
+def register_agent(agent_id, ip=None, count=True):
+    """Register or update an agent.  Returns the agent dict or None.
+    Set count=False when registering a peer reference (don't bump msg count).
+    """
     global AGENT_COUNTER
     if not agent_id:
         return None
 
-    if agent_id not in AGENTS:
-        hostname, hashsuffix = parse_agent_id(agent_id)
-        color = AGENT_COLORS[AGENT_COUNTER % len(AGENT_COLORS)]
-        AGENT_COUNTER += 1
-        AGENTS[agent_id] = {
-            'agent_id':      agent_id,
-            'hostname':      hostname,
-            'hash':          hashsuffix,
-            'name':          hostname or agent_id,   # readable default
-            'custom_name':   None,
-            'color':         color,
-            'last_seen':     time.time(),
-            'message_count': 0,
-            'ip':            ip or '',
-        }
+    with _lock:
+        if agent_id not in AGENTS:
+            hostname, hashsuffix = parse_agent_id(agent_id)
+            # Restore saved settings if available
+            saved = _saved_settings.get(agent_id, {})
+            color = saved.get('color') or AGENT_COLORS[AGENT_COUNTER % len(AGENT_COLORS)]
+            AGENT_COUNTER += 1
+            AGENTS[agent_id] = {
+                'agent_id':      agent_id,
+                'hostname':      hostname,
+                'hash':          hashsuffix,
+                'name':          hostname or agent_id,
+                'custom_name':   saved.get('custom_name'),
+                'color':         color,
+                'last_seen':     time.time(),
+                'message_count': 0,
+                'ip':            ip or '',
+            }
 
-    a = AGENTS[agent_id]
-    if ip:
-        a['ip'] = ip
-    a['last_seen'] = time.time()
-    a['message_count'] += 1
-    return a
+        a = AGENTS[agent_id]
+        if ip:
+            a['ip'] = ip
+        a['last_seen'] = time.time()
+        if count:
+            a['message_count'] += 1
+        return a
 
 def dname(agent):
     """Display name for an agent dict."""
@@ -234,7 +406,8 @@ def dname(agent):
 
 def dname_for_id(agent_id):
     """Display name looked up by agent_id string."""
-    a = AGENTS.get(agent_id)
+    with _lock:
+        a = AGENTS.get(agent_id)
     if a:
         return dname(a)
     hostname, _ = parse_agent_id(agent_id)
@@ -243,10 +416,25 @@ def dname_for_id(agent_id):
 def acolor(agent):
     return agent['color'] if agent else '#6e7681'
 
+def _cleanup_stale_agents():
+    """Background thread: prune agents not seen in STALE_AGENT_HOURS."""
+    while _running:
+        time.sleep(3600)
+        cutoff = time.time() - STALE_AGENT_HOURS * 3600
+        with _lock:
+            stale = [aid for aid, a in AGENTS.items()
+                     if a['last_seen'] < cutoff]
+            for aid in stale:
+                del AGENTS[aid]
+        if stale:
+            print(f"  Pruned {len(stale)} stale agent(s)")
+            socketio.emit('agents_update', get_agents_list())
+
 # =============================================================================
 # Listener
 # =============================================================================
 def udp_listener():
+    global _running
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -254,79 +442,98 @@ def udp_listener():
     except Exception:
         pass
     sock.bind((BIND_ADDRESS, RELAY_PORT))
+    sock.settimeout(1.0)
     print(f"  Relay listener on {BIND_ADDRESS}:{RELAY_PORT}")
 
-    while True:
-        try:
-            data, addr = sock.recvfrom(65535)
-            raw        = data.decode('utf-8', errors='replace')
-            source_ip  = addr[0]
-            source_port = addr[1]
-            now        = datetime.now()
-            timestamp  = now.strftime('%H:%M:%S.') + f'{now.microsecond // 1000:03d}'
+    try:
+        while _running:
+            # ── Receive ──────────────────────────────────
+            try:
+                data, addr = sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                print(f"  Socket error: {e}", file=sys.stderr)
+                break
 
-            info, display_text, category = decode_packet(raw)
+            try:
+                raw         = data.decode('utf-8', errors='replace')
+                source_ip   = addr[0]
+                source_port = addr[1]
+                now         = datetime.now()
+                timestamp   = now.strftime('%H:%M:%S.') + f'{now.microsecond // 1000:03d}'
 
-            # Primary agent
-            if info:
-                from_id = info.get('agent_id') or info.get('sender_id') or source_ip
-            else:
-                from_id = source_ip
-            agent = register_agent(from_id, source_ip)
+                info, display_text, category = decode_packet(raw)
 
-            # Register peer (seen in relay) without bumping its count
-            peer_id = info.get('peer_id') if info else None
-            if peer_id:
-                register_agent(peer_id)
-                AGENTS[peer_id]['message_count'] = max(
-                    0, AGENTS[peer_id]['message_count'] - 1)
-
-            # Build the arrow string using display names
-            arrow = ''
-            if info and 'from_id' in info:
-                fn = dname_for_id(info['from_id'])
-                tn = dname_for_id(info['to_id']) if info.get('to_id') else ''
-                if tn:
-                    arrow = f'{fn}  \u2192  {tn}'
+                # ── Register agents ──────────────────────
+                if info:
+                    primary_id = info.get('agent_id') or info.get('sender_id') or source_ip
                 else:
-                    arrow = fn
+                    primary_id = source_ip
+                agent = register_agent(primary_id, source_ip)
 
-            # Stats
-            if category.startswith('relay'):
-                STATS['relay'] += 1
-            elif category == 'discovery':
-                STATS['discovery'] += 1
-            elif category == 'message':
-                STATS['message'] += 1
-            else:
-                STATS['unknown'] += 1
+                # Register peer (seen in relay) without bumping its count
+                peer_id = info.get('peer_id') if info else None
+                if peer_id:
+                    register_agent(peer_id, count=False)
 
-            msg_entry = {
-                'timestamp':   timestamp,
-                'source_ip':   source_ip,
-                'source_port': source_port,
-                'sender':      dname(agent),
-                'color':       acolor(agent),
-                'message':     display_text,
-                'raw_message': raw,
-                'is_json':     info is None and _is_json(raw),
-                'is_protocol': info is not None,
-                'proto_info':  info,
-                'category':    category,
-                'arrow':       arrow,
-            }
+                # ── Determine speaker (who said the message) ──
+                speaker_id = (info.get('speaker') if info else None) or primary_id
+                speaker_agent = AGENTS.get(speaker_id)
 
-            MESSAGES.append(msg_entry)
-            if len(MESSAGES) > MAX_MESSAGES:
-                MESSAGES.pop(0)
+                # ── Build arrow string ───────────────────
+                arrow = ''
+                if info and 'from_id' in info:
+                    fn = dname_for_id(info['from_id'])
+                    tn = dname_for_id(info['to_id']) if info.get('to_id') else ''
+                    if tn:
+                        arrow = f'{fn}  →  {tn}'
+                    else:
+                        arrow = fn
 
-            socketio.emit('new_message', msg_entry)
-            socketio.emit('agents_update', get_agents_list())
-            socketio.emit('stats_update', STATS)
+                # ── Stats ────────────────────────────────
+                with _lock:
+                    if category.startswith('relay'):
+                        STATS['relay'] += 1
+                    elif category == 'discovery':
+                        STATS['discovery'] += 1
+                    elif category == 'message':
+                        STATS['message'] += 1
+                    else:
+                        STATS['unknown'] += 1
 
-        except Exception as e:
-            print(f"  Listener error: {e}")
-            time.sleep(1)
+                msg_entry = {
+                    'timestamp':   timestamp,
+                    'source_ip':   source_ip,
+                    'source_port': source_port,
+                    'sender':      dname(speaker_agent) if speaker_agent else dname_for_id(speaker_id),
+                    'sender_id':   speaker_id,
+                    'color':       acolor(speaker_agent) if speaker_agent else '#6e7681',
+                    'message':     display_text,
+                    'raw_message': raw,
+                    'is_json':     info is None and _is_json(raw),
+                    'is_protocol': info is not None,
+                    'proto_info':  info,
+                    'category':    category,
+                    'arrow':       arrow,
+                }
+
+                with _lock:
+                    MESSAGES.append(msg_entry)
+                    if len(MESSAGES) > MAX_MESSAGES:
+                        MESSAGES.pop(0)
+
+                _log_message(msg_entry)
+                socketio.emit('new_message', msg_entry)
+                socketio.emit('agents_update', get_agents_list())
+                socketio.emit('stats_update', STATS)
+
+            except Exception as e:
+                print(f"  Packet processing error: {e}", file=sys.stderr)
+
+    finally:
+        sock.close()
+        print("  Relay listener stopped")
 
 def _is_json(s):
     try:
@@ -338,29 +545,44 @@ def _is_json(s):
 # =============================================================================
 # Send (monitor UI → agents)
 # =============================================================================
-def send_udp_message(target_ip, message, port=AGENT_PORT):
+def _init_send_socket():
+    global _send_sock
+    _send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+def send_udp_message(target_ip, message, port=AGENT_PORT, bind_ip=None):
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.sendto(message.encode('utf-8'), (target_ip, port))
-        sock.close()
+        # If a specific interface is requested, create a bound socket
+        if bind_ip:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind((bind_ip, 0))
+            sock.sendto(message.encode('utf-8'), (target_ip, port))
+            sock.close()
+        else:
+            _send_sock.sendto(message.encode('utf-8'), (target_ip, port))
 
         now = datetime.now()
         timestamp = now.strftime('%H:%M:%S.') + f'{now.microsecond // 1000:03d}'
         msg_entry = {
-            'timestamp': timestamp, 'source_ip': LOCAL_IP,
-            'source_port': port, 'sender': 'Monitor', 'color': '#ffffff',
+            'timestamp': timestamp, 'source_ip': bind_ip or LOCAL_IP,
+            'source_port': port, 'sender': 'Monitor', 'sender_id': '_monitor_',
+            'color': '#ffffff',
             'message': message, 'raw_message': message,
             'is_json': _is_json(message), 'is_protocol': False,
             'proto_info': None, 'category': 'monitor-out', 'arrow': '',
         }
-        MESSAGES.append(msg_entry)
-        if len(MESSAGES) > MAX_MESSAGES:
-            MESSAGES.pop(0)
+
+        with _lock:
+            MESSAGES.append(msg_entry)
+            if len(MESSAGES) > MAX_MESSAGES:
+                MESSAGES.pop(0)
+
+        _log_message(msg_entry)
         socketio.emit('new_message', msg_entry)
         return True
     except Exception as e:
-        print(f"  Send error: {e}")
+        print(f"  Send error: {e}", file=sys.stderr)
         return False
 
 # =============================================================================
@@ -369,43 +591,59 @@ def send_udp_message(target_ip, message, port=AGENT_PORT):
 def get_agents_list():
     now = time.time()
     out = []
-    for aid, a in AGENTS.items():
-        out.append({
-            'agent_id':     aid,
-            'hostname':     a.get('hostname', ''),
-            'hash':         a.get('hash', ''),
-            'ip':           a.get('ip', ''),
-            'name':         dname(a),
-            'default_name': a['name'],
-            'custom_name':  a.get('custom_name') or '',
-            'color':        a['color'],
-            'online':       (now - a['last_seen']) < 60,
-            'last_seen':    datetime.fromtimestamp(a['last_seen']).strftime('%H:%M:%S'),
-            'message_count': a['message_count'],
-        })
+    with _lock:
+        for aid, a in AGENTS.items():
+            out.append({
+                'agent_id':      aid,
+                'hostname':      a.get('hostname', ''),
+                'hash':          a.get('hash', ''),
+                'ip':            a.get('ip', ''),
+                'name':          dname(a),
+                'default_name':  a['name'],
+                'custom_name':   a.get('custom_name') or '',
+                'color':         a['color'],
+                'online':        (now - a['last_seen']) < 60,
+                'last_seen':     datetime.fromtimestamp(a['last_seen']).strftime('%H:%M:%S'),
+                'message_count': a['message_count'],
+            })
     return out
 
-def _rebuild_arrows():
-    """Rewrite arrow text in all messages using current display names."""
-    for msg in MESSAGES:
-        pi = msg.get('proto_info')
-        if pi and 'from_id' in pi:
-            fn = dname_for_id(pi['from_id'])
-            tn = dname_for_id(pi['to_id']) if pi.get('to_id') else ''
-            msg['arrow'] = f'{fn}  \u2192  {tn}' if tn else fn
+def _update_messages_for_agent(agent_id):
+    """Update sender labels and arrows for all messages involving agent_id."""
+    dn = dname_for_id(agent_id)
+    with _lock:
+        for msg in MESSAGES:
+            pi = msg.get('proto_info')
+            if not pi:
+                continue
+            # Update sender label if this agent is the speaker
+            if msg.get('sender_id') == agent_id:
+                msg['sender'] = dn
+            # Rebuild arrow if either end matches
+            if 'from_id' in pi and agent_id in (pi.get('from_id'), pi.get('to_id', '')):
+                fn = dname_for_id(pi['from_id'])
+                tn = dname_for_id(pi['to_id']) if pi.get('to_id') else ''
+                msg['arrow'] = f'{fn}  →  {tn}' if tn else fn
 
 # =============================================================================
 # Routes
 # =============================================================================
+_cached_html = None
+
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE,
-        local_ip=LOCAL_IP, broadcast_ip=BROADCAST_IP,
-        relay_port=RELAY_PORT, agent_port=AGENT_PORT)
+    global _cached_html
+    if _cached_html is None:
+        _cached_html = render_template_string(HTML_TEMPLATE,
+            local_ip=LOCAL_IP, broadcast_ip=BROADCAST_IP,
+            relay_port=RELAY_PORT, agent_port=AGENT_PORT,
+            interfaces=INTERFACES)
+    return _cached_html
 
 @app.route('/api/messages')
 def api_messages():
-    return jsonify(MESSAGES)
+    with _lock:
+        return jsonify(list(MESSAGES))
 
 @app.route('/api/agents')
 def api_agents():
@@ -413,44 +651,64 @@ def api_agents():
 
 @app.route('/api/stats')
 def api_stats():
-    return jsonify(STATS)
+    with _lock:
+        return jsonify(dict(STATS))
+
+@app.route('/api/interfaces')
+def api_interfaces():
+    return jsonify(INTERFACES)
+
+@app.route('/api/export')
+def api_export():
+    """Download the full JSONL log file."""
+    if os.path.exists(LOG_FILE):
+        return send_file(LOG_FILE, mimetype='application/x-ndjson',
+                         as_attachment=True,
+                         download_name='relay_log.jsonl')
+    return jsonify({'error': 'No log file yet'}), 404
 
 @app.route('/send', methods=['POST'])
 def handle_send():
-    data = request.json
+    data = request.json or {}
     target  = data.get('target_ip', BROADCAST_IP)
     message = data.get('message', '')
-    port    = int(data.get('port', AGENT_PORT))
+    bind_ip = data.get('bind_ip', None)    # interface IP to send from
+    # Validate port
+    try:
+        port = int(data.get('port', AGENT_PORT))
+        if not (1 <= port <= 65535):
+            return jsonify({'success': False, 'error': 'Invalid port'})
+    except (ValueError, TypeError):
+        return jsonify({'success': False, 'error': 'Invalid port'})
     if not message:
         return jsonify({'success': False, 'error': 'Empty message'})
-    return jsonify({'success': send_udp_message(target, message, port)})
+    return jsonify({'success': send_udp_message(target, message, port, bind_ip)})
 
 @app.route('/api/rename_agent', methods=['POST'])
 def rename_agent():
-    data     = request.json
+    data     = request.json or {}
     agent_id = data.get('agent_id', '')
     new_name = data.get('name', '').strip()
-    if agent_id not in AGENTS:
-        return jsonify({'success': False, 'error': 'Agent not found'})
-    AGENTS[agent_id]['custom_name'] = new_name or None
-    dn = dname(AGENTS[agent_id])
-    # Update sender labels
-    for msg in MESSAGES:
-        pi = msg.get('proto_info')
-        if pi:
-            aid = pi.get('agent_id') or pi.get('sender_id')
-            if aid == agent_id:
-                msg['sender'] = dn
-    # Rebuild all arrows so renamed agents show correctly
-    _rebuild_arrows()
+
+    with _lock:
+        if agent_id not in AGENTS:
+            return jsonify({'success': False, 'error': 'Agent not found'})
+        AGENTS[agent_id]['custom_name'] = new_name or None
+
+    _update_messages_for_agent(agent_id)
+    _save_settings()
+
+    dn = dname_for_id(agent_id)
     socketio.emit('agents_update', get_agents_list())
-    socketio.emit('full_refresh', MESSAGES)
+    with _lock:
+        socketio.emit('full_refresh', list(MESSAGES))
     return jsonify({'success': True, 'name': dn})
 
 @socketio.on('connect')
 def handle_connect():
     socketio.emit('agents_update', get_agents_list())
-    socketio.emit('stats_update', STATS)
+    with _lock:
+        socketio.emit('stats_update', dict(STATS))
 
 # =============================================================================
 # HTML
@@ -620,7 +878,7 @@ option{background:var(--bg1);color:var(--t1)}
     <div class="dot"></div>
     <h1>OpenClaw Relay Monitor</h1>
     <span class="hb hb-p">CLAUDE-UDP-V1</span>
-    <span class="hb hb-i">{{ local_ip }}</span>
+    {% for iface in interfaces %}<span class="hb hb-i" title="{{ iface.name }}">{{ iface.ip }}</span>{% endfor %}
     <span class="hb hb-r">relay :{{ relay_port }}</span>
     <span class="hb hb-a">agent :{{ agent_port }}</span>
   </div>
@@ -649,7 +907,7 @@ option{background:var(--bg1);color:var(--t1)}
       <div class="es" id="es">
         <div class="ic">&#x1F4E1;</div>
         <p>Waiting for relay traffic on port {{ relay_port }}...</p>
-        <p style="font-size:11px">Configure agents:  relayServer: "{{ local_ip }}:{{ relay_port }}"</p>
+        <p style="font-size:11px">Configure agents:  relayServer: "{{ local_ip }}:{{ relay_port }}"{% if interfaces|length > 1 %}  ({{ interfaces|length }} interfaces detected){% endif %}</p>
       </div>
     </div>
   </div>
@@ -662,6 +920,9 @@ option{background:var(--bg1);color:var(--t1)}
 
     <div class="ss">
       <div class="ptl" style="margin:-10px -14px 10px -14px;padding:8px 14px">Send to Agent</div>
+      <select class="ssel" id="sIface">
+        {% for iface in interfaces %}<option value="{{ iface.ip }}" data-bc="{{ iface.broadcast }}">{{ iface.name }} — {{ iface.ip }}{% if iface.broadcast %} (bc: {{ iface.broadcast }}){% endif %}</option>{% endfor %}
+      </select>
       <select class="ssel" id="sTgt"><option value="{{ broadcast_ip }}">Broadcast ({{ broadcast_ip }})</option></select>
       <select class="spsel" id="sPrt">
         <option value="{{ agent_port }}">Agent port :{{ agent_port }}</option>
@@ -687,14 +948,30 @@ const io_s = io();
 const feed = document.getElementById('feed');
 const es   = document.getElementById('es');
 const aList = document.getElementById('aList');
+const sIface = document.getElementById('sIface');
 const sTgt = document.getElementById('sTgt');
 const sPrt = document.getElementById('sPrt');
 const sIn  = document.getElementById('sIn');
 const sBtn = document.getElementById('sBtn');
 const sSt  = document.getElementById('sSt');
 const si   = document.getElementById('si');
-const BC   = '{{ broadcast_ip }}';
+let BC     = '{{ broadcast_ip }}';
 let mc = 0, aScr = true, filt = 'all', cAgents = [];
+
+/* Interface selector — update broadcast address when interface changes */
+sIface.addEventListener('change',function(){
+  const opt=sIface.options[sIface.selectedIndex];
+  BC=opt.dataset.bc||'255.255.255.255';
+  rebuildTargets();
+});
+function rebuildTargets(){
+  const cv=sTgt.value;
+  sTgt.innerHTML='<option value="'+BC+'">Broadcast ('+BC+')</option>';
+  cAgents.forEach(a=>{
+    if(a.ip){const o=document.createElement('option');o.value=a.ip;o.textContent=a.name+' ('+a.ip+')';sTgt.appendChild(o)}
+  });
+  if(cv){sTgt.value=cv;if(!sTgt.value)sTgt.value=BC}
+}
 
 /* Uptime */
 const t0 = Date.now();
@@ -769,13 +1046,16 @@ function render(msg){
 function pt(l,v){return'<span class="pt"><span class="l">'+l+':</span><span class="v">'+esc(String(v))+'</span></span>'}
 function esc(s){if(s==null)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
 
-/* Agents */
+/* Agents — delegated click handler (XSS safe) */
+aList.addEventListener('click',function(e){
+  const nm=e.target.closest('.anm');
+  if(nm&&nm.dataset.aid)oR(nm.dataset.aid);
+});
+
 function uA(agents){
   cAgents=agents;
-  if(!agents.length){aList.innerHTML='<div class="na">No agents detected yet</div>';return}
+  if(!agents.length){aList.innerHTML='<div class="na">No agents detected yet</div>';rebuildTargets();return}
   aList.innerHTML='';
-  const cv=sTgt.value;
-  sTgt.innerHTML='<option value="'+BC+'">Broadcast ('+BC+')</option>';
   agents.forEach(a=>{
     const r=document.createElement('div');r.className='arow';
     let hh='';
@@ -783,13 +1063,12 @@ function uA(agents){
     r.innerHTML=
       '<div class="adot'+(a.online?' on':'')+'" style="background:'+a.color+';color:'+a.color+'"></div>'+
       '<div class="ai"><div class="anr">'+
-        '<span class="anm" style="color:'+a.color+'" onclick="oR(\''+esc(a.agent_id)+'\')" title="Click to rename">'+esc(a.name)+'</span>'+hh+
+        '<span class="anm" data-aid="'+esc(a.agent_id)+'" style="color:'+a.color+'" title="Click to rename">'+esc(a.name)+'</span>'+hh+
       '</div><div class="aip">'+(a.ip?esc(a.ip):'no IP')+'</div></div>'+
       '<div class="ast"><div>'+a.message_count+' msgs</div><div>'+(a.online?'online':a.last_seen)+'</div></div>';
     aList.appendChild(r);
-    if(a.ip){const o=document.createElement('option');o.value=a.ip;o.textContent=a.name+' ('+a.ip+')';sTgt.appendChild(o)}
   });
-  if(cv){sTgt.value=cv;if(!sTgt.value)sTgt.value=BC}
+  rebuildTargets();
 }
 
 /* Stats */
@@ -821,10 +1100,11 @@ io_s.on('agents_update',uA);
 
 /* Send */
 function snd(){const m=sIn.value.trim();if(!m)return;sBtn.disabled=true;
+  const bindIp=sIface.value;
   fetch('/send',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({target_ip:sTgt.value,message:m,port:sPrt.value})
+    body:JSON.stringify({target_ip:sTgt.value,message:m,port:sPrt.value,bind_ip:bindIp})
   }).then(r=>r.json()).then(d=>{sSt.style.color=d.success?'var(--grn)':'var(--red)';
-    sSt.textContent=d.success?'Sent to '+sTgt.value+':'+sPrt.value:'Failed';
+    sSt.textContent=d.success?'Sent via '+bindIp+' to '+sTgt.value+':'+sPrt.value:'Failed';
     if(d.success)sIn.value='';setTimeout(()=>sSt.textContent='',3e3)
   }).catch(()=>{sSt.style.color='var(--red)';sSt.textContent='Network error';
     setTimeout(()=>sSt.textContent='',3e3)}).finally(()=>sBtn.disabled=false)}
@@ -843,20 +1123,32 @@ sIn.focus();
 # Main
 # =============================================================================
 if __name__ == '__main__':
-    print(f"{'='*58}")
+    print(f"{'=' * 58}")
     print(f"  OpenClaw Relay Monitor")
     print(f"  Protocol:    CLAUDE-UDP-V1")
     print(f"  Plugin:      openclaw-udp-messenger v1.5")
-    print(f"  Local IP:    {LOCAL_IP}")
     print(f"  Relay Port:  {RELAY_PORT}  (agents relay events here)")
     print(f"  Agent Port:  {AGENT_PORT}  (agent-to-agent)")
     print(f"  Web UI:      http://{LOCAL_IP}:{WEB_PORT}")
+    print(f"  Log File:    {LOG_FILE}")
+    print(f"  Settings:    {SETTINGS_FILE}")
     print(f"  ")
-    print(f"  Agent config:  relayServer: \"{LOCAL_IP}:{RELAY_PORT}\"")
+    print(f"  Network interfaces ({len(INTERFACES)}):")
+    for iface in INTERFACES:
+        print(f"    {iface['name']:20s}  {iface['ip']:15s}  bc: {iface['broadcast']}")
+    print(f"  ")
+    print(f"  Agent config:  relayServer: \"<YOUR_IP>:{RELAY_PORT}\"")
+    for iface in INTERFACES:
+        print(f"    {iface['name']:20s}  relayServer: \"{iface['ip']}:{RELAY_PORT}\"")
+    print(f"  ")
     print(f"  GitHub:  https://github.com/turfptax/openclaw-udp-messenger")
     print(f"  ClawHub: https://clawhub.ai/turfptax/udp-messenger")
-    print(f"{'='*58}")
+    print(f"{'=' * 58}")
 
+    _load_settings()
+    _init_send_socket()
     threading.Thread(target=udp_listener, daemon=True).start()
+    threading.Thread(target=_cleanup_stale_agents, daemon=True).start()
+    threading.Thread(target=_settings_flush_loop, daemon=True).start()
     socketio.run(app, host='0.0.0.0', port=WEB_PORT,
                  debug=False, allow_unsafe_werkzeug=True)
